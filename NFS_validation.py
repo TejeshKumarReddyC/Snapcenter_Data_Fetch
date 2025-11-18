@@ -6,14 +6,15 @@ import re
 from datetime import datetime
 
 INPUT_FILE = "vservers.csv"  # CSV input
-JUMP_HOST = "Host_IP_address"
-JUMP_USER = "mxxxxxx"
+JUMP_HOST = "10.17.64.27"
+JUMP_USER = "mc292242"
 
 IGNORED_CLIENT_TOKENS = {
     "query.",
-    "jumphost1",
-    "jumphost2",
-  
+    "c860juu.int.thomsonreuters.com",
+    "c860juu",
+    "c240uih",
+    "c240uih.int.thomsonreuters.com",
 }
 
 # === NEW: normalization to treat domain variants as same ===
@@ -25,14 +26,28 @@ def normalize_clientmatch(c):
         c = c[:-4]
     return c
 
+last_vserver_written = None
+
 def log_append(fp, msg, results_fp=None):
-    """Write message to main log, and if it's a result line, also to results log."""
+    global last_vserver_written
     print(msg)
+    # Write to main log
     fp.write(msg + "\n")
     fp.flush()
+
+    # Handle RESULT formatting
     if results_fp and msg.strip().startswith("==> RESULT:"):
+        # Extract the vserver name after "==> RESULT:"
+        try:
+            vserver = msg.split("|")[0].replace("==> RESULT:", "").strip()
+        except:
+            vserver = None
+        # Add blank line *before* new vserver block
+        if last_vserver_written and vserver != last_vserver_written:
+            results_fp.write("\n")
         results_fp.write(msg + "\n")
         results_fp.flush()
+        last_vserver_written = vserver
 
 def ssh_connect(host, username, password, timeout=30):
     client = paramiko.SSHClient()
@@ -564,7 +579,7 @@ def special_policy_volume_check(filer_client, jump_client, admin_pass, vserver, 
 # === MAIN ===
 if __name__ == "__main__":
     jump_pass = getpass.getpass("Enter jump server password: ")
-    admin_pass = getpass.getpass("Enter admin password for physical filer")
+    admin_pass = "zC0MgNT86e2Gcpl"
 
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
     log_file = f"shared_check_all_{ts}.log"
