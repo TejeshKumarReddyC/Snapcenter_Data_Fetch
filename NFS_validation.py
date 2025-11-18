@@ -6,15 +6,13 @@ import re
 from datetime import datetime
 
 INPUT_FILE = "vservers.csv"  # CSV input
-JUMP_HOST = "10.17.64.27"
-JUMP_USER = "mc292242"
+JUMP_HOST = "jump_host_ip_here"
+JUMP_USER = "xxxxxx"
 
 IGNORED_CLIENT_TOKENS = {
     "query.",
-    "c860juu.int.thomsonreuters.com",
-    "c860juu",
-    "c240uih",
-    "c240uih.int.thomsonreuters.com",
+    "jump_host1",
+    "jump_host2",
 }
 
 # === NEW: normalization to treat domain variants as same ===
@@ -579,7 +577,7 @@ def special_policy_volume_check(filer_client, jump_client, admin_pass, vserver, 
 # === MAIN ===
 if __name__ == "__main__":
     jump_pass = getpass.getpass("Enter jump server password: ")
-    admin_pass = "zC0MgNT86e2Gcpl"
+    admin_pass = getpass.getpass("Enter admin password")
 
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
     log_file = f"shared_check_all_{ts}.log"
