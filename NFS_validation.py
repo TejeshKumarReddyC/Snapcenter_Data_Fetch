@@ -6,15 +6,14 @@ import re
 from datetime import datetime
 
 INPUT_FILE = "vservers.csv"  # CSV input
-JUMP_HOST = "jump_host_ip_here"
-JUMP_USER = "xxxxxx"
+JUMP_HOST = "10.17.64.27"
+JUMP_USER = "mc292242"
 
 IGNORED_CLIENT_TOKENS = {
     "query.",
-    "jump_host1",
-    "jump_host2",
+    "jump1.example.com",
+    "jump2.example.com",
 }
-
 # === NEW: normalization to treat domain variants as same ===
 def normalize_clientmatch(c):
     if not c:
@@ -160,88 +159,120 @@ def parse_clientmatches_from_export_policy(output):
             found.add(normalize_clientmatch(candidate))
     return found
 
-# Helpers to parse qtree output and extract qtree names (3rd column)
-def parse_qtrees_from_qtree_show(output):
+# Helpers to parse qtree output and extract qtree names (3rd column) and export-policy (4th)
+def parse_qtrees_and_export_policies_from_qtree_show(output):
     """
-    Robust qtree extractor for 'vol qtree show' output.
+    Return list of tuples: (qtree_name_or_empty, export_policy_or_empty)
+    Handles cases where the export-policy may be on the same row or on the following wrapped row.
     """
-    qtrees = []
     if not output:
-        return qtrees
+        return []
 
-    def is_footer_line(s):
-        return bool(re.search(r'\bentries?\b.*\bdisplayed\b', s)) or bool(re.match(r'^\d+\s+entries?\b', s))
+    lines = [ln.rstrip() for ln in output.splitlines()]
+    # keep only non-empty lines but preserve their order for parsing
+    nonempty = [ln for ln in lines if ln.strip()]
 
-    def is_timestamp_line(s):
-        return bool(re.match(r'^\d{1,2}:\d{1,2}:\d{1,2}', s))
-
-    valid_qtree_re = re.compile(r'^[A-Za-z0-9_.\-]+$')
-
-    lines = [ln.rstrip() for ln in output.splitlines() if ln.strip()]
-
+    # find header start index if present
     header_idx = None
-    for idx, ln in enumerate(lines):
+    for idx, ln in enumerate(nonempty):
         low = ln.lower()
         if 'vserver' in low and 'volume' in low and 'qtree' in low:
             header_idx = idx
             break
 
-    data_start = (header_idx + 1) if header_idx is not None else 0
+    data_lines = nonempty[header_idx + 1:] if header_idx is not None else nonempty
 
-    for ln in lines[data_start:]:
-        low = ln.lower().strip()
-
-        if is_footer_line(low):
-            continue
-        if is_timestamp_line(low):
-            continue
-        if '&' in ln and not ':' in ln:
-            pass
-
-        if re.match(r'^[-=_\s]+$', ln):
+    parsed = []
+    # We'll try to extract columns by splitting on 2+ spaces, but be defensive
+    idx = 0
+    while idx < len(data_lines):
+        ln = data_lines[idx]
+        # skip separator lines
+        if re.match(r'^[-=_\s]+$', ln.strip()):
+            idx += 1
             continue
 
         cols = re.split(r'\s{2,}', ln)
+        # If there are less than 3 columns, try split on whitespace
         if len(cols) < 3:
-            cols = re.split(r'\s+', ln)
+            cols = re.split(r'\s+', ln.strip())
             if len(cols) < 3:
+                # Might be a wrapped export-policy line (indented). Try to merge with previous.
+                # If previous exists and we have an entry with empty export-policy, attach this as export-policy.
+                # We'll handle this by attempting to parse next line as possibly export-policy-only.
+                # For safety, attempt simple heuristic: if line starts with whitespace then it's a continuation.
+                if ln.startswith(" ") or ln.startswith("\t"):
+                    # attach to previous if previous had no export-policy
+                    if parsed and not parsed[-1][1]:
+                        ep = ln.strip()
+                        prev_q, _ = parsed[-1]
+                        parsed[-1] = (prev_q, ep)
+                idx += 1
                 continue
 
-        raw_q = cols[2].strip().strip('"')
-        if raw_q == '""' or raw_q == 'none':
-            raw_q = ""
-
-        if raw_q == "" or valid_qtree_re.match(raw_q):
-            qtrees.append(raw_q)
+        # Now extract qtree (3rd column) and export-policy (4th column if present)
+        qtree = ""
+        export_policy = ""
+        # cols may be: [vserver, volume, qtree, export-policy] or sometimes qtree field is "" and export-policy on same row
+        if len(cols) >= 3:
+            qtree = cols[2].strip().strip('"')
+            if qtree.lower() == '""' or qtree.lower() == 'none':
+                qtree = ""
+        if len(cols) >= 4:
+            export_policy = cols[3].strip()
         else:
-            continue
+            # Look ahead to next line: sometimes export-policy is displayed on the next physical line (indented)
+            if idx + 1 < len(data_lines):
+                next_ln = data_lines[idx + 1]
+                # heuristic: export-policy-only lines often are indented or don't contain a vserver/volume/qtree pattern
+                if not re.search(r'\S+\s+\S+\s+\S+', next_ln):
+                    # treat the trimmed next line as possible export-policy
+                    possible = next_ln.strip()
+                    if possible:
+                        export_policy = possible
+                        idx += 1  # consume next line
+        # If export_policy is '""' or 'none' treat as empty
+        if export_policy.lower().strip() in ('', '""', 'none'):
+            export_policy = ""
+
+        parsed.append((qtree, export_policy))
+        idx += 1
 
     # dedupe preserving order
     seen = set()
     deduped = []
-    for q in qtrees:
-        if q not in seen:
-            deduped.append(q)
-            seen.add(q)
-
+    for q, e in parsed:
+        key = (q, e)
+        if key not in seen:
+            deduped.append((q, e))
+            seen.add(key)
     return deduped
 
-def check_qtrees_against_global(filer_client, vserver, qtree_list, global_clients, f_log):
+def check_qtrees_against_global_using_export_policy(filer_client, vserver, qtree_policy_pairs, global_clients, f_log):
+    """
+    qtree_policy_pairs: list of (qtree, export_policy)
+    For each pair, choose export_policy (if present) else qtree for the export-policy rule show check.
+    Returns (ok_bool, list_of_reasons, set_of_external_clients)
+    """
     reasons = []
-    for q in qtree_list:
-        if not q:
+    external_clients_accum = set()
+    for q, ep in qtree_policy_pairs:
+        policy_to_check = ep if ep else q
+        if not policy_to_check:
             continue
-        cmd = f"export-policy rule show -vserver {vserver} -policyname {q} -fields clientmatch"
-        out = run_check(filer_client, cmd, f_log=f_log, context=f"{vserver}:{q} - export-policy (qtree)")
+        cmd = f"export-policy rule show -vserver {vserver} -policyname {policy_to_check} -fields clientmatch"
+        out = run_check(filer_client, cmd, f_log=f_log, context=f"{vserver}:{policy_to_check} - export-policy (qtree/ep)")
         clients = parse_clientmatches_from_export_policy(out)
         clients_l = {normalize_clientmatch(x) for x in clients if x}
         if not clients_l:
             continue
         extra = clients_l - global_clients
         if extra:
-            reasons.append(f"qtree '{q}' has external clientmatch: {', '.join(sorted(extra))}")
-            return False, reasons
-    return True, []
+            reasons.append(f"policy '{policy_to_check}' has external clientmatch: {', '.join(sorted(extra))}")
+            external_clients_accum.update(extra)
+    if external_clients_accum:
+        return False, reasons, external_clients_accum
+    return True, [], set()
 
 def get_volume_state_from_output(output):
     if not output:
@@ -267,25 +298,67 @@ def get_volume_state(filer_client, vserver, volume, f_log):
 
 def collect_vserver_data(filer_client, vserver, f_log):
     commands = {
-        "Qtree relations": f"vol qtree show -vserver {vserver} -volume * -fields export-policy",
-        "CIFS shares": f"cifs share show -vserver {vserver}",
-        "LUNs": f"lun show -vserver {vserver}",
-        "SnapMirror destinations": f"snapmirror list-destinations -source-path {vserver}:*",
-    }
-    for desc, cmd in commands.items():
-        run_fetch(filer_client, cmd, f_log=f_log, context=f"{vserver} - {desc}")
-
-def collect_volume_data(filer_client, vserver, volume, f_log):
-    commands = {
+        "Volume show": f"volume show -vserver {vserver}",
+        "Export-policy rules": f"export-policy rule show -vserver {vserver} -policyname * -fields clientmatch",
         "CIFS shares": f"cifs share show -vserver {vserver}",
         "CIFS sessions": f"cifs session show -vserver {vserver}",
         "LUNs": f"lun show -vserver {vserver}",
-        "Qtree relations": f"vol qtree show -vserver {vserver} -volume {volume} -fields export-policy",
-        "SnapMirror destinations": f"snapmirror list-destinations -source-path {vserver}:{volume}",
-        "Volume state": f"volume show -vserver {vserver} -volume {volume}",
+        "SnapMirror destinations": f"snapmirror list-destinations -source-path {vserver}:*",
+        "Export-policy show": f"export-policy show -vserver {vserver}",
+        # Your existing ones (kept)
+        #"Qtree relations": f"vol qtree show -vserver {vserver} -volume * -fields export-policy",
     }
+
     for desc, cmd in commands.items():
-        run_fetch(filer_client, cmd, f_log=f_log, context=f"{vserver}:{volume} - {desc}")
+        run_fetch(
+            filer_client,
+            cmd,
+            f_log=f_log,
+            context=f"{vserver} - {desc}"
+        )
+
+def collect_volume_data(filer_client, vserver, volume, f_log):
+    commands = {
+        # 1. Vserver-level volume show
+        "Volume show (vserver-level)": f"volume show -vserver {vserver}",
+
+        # 2. All export policies in vserver
+        "Export-policy rules (all policies)": (
+            f"export-policy rule show -vserver {vserver} -policyname * -fields clientmatch"
+        ),
+
+        # 3. Export policy specific to this volume
+        "Export-policy rules (volume policy)": (
+            f"export-policy rule show -vserver {vserver} -policyname {volume} -fields clientmatch"
+        ),
+
+        # 4. Qtree relations
+        "Qtree relations": (
+            f"vol qtree show -vserver {vserver} -volume {volume} -fields export-policy"
+        ),
+
+        # 5. SnapMirror destinations (vserver-level)
+        "SnapMirror destinations (all volumes)": (
+            f"snapmirror list-destinations -source-path {vserver}:*"
+        ),
+
+        # Existing commands kept below
+        #"CIFS shares": f"cifs share show -vserver {vserver}",
+        #"CIFS sessions": f"cifs session show -vserver {vserver}",
+        #"LUNs": f"lun show -vserver {vserver}",
+        #"Volume state": f"volume show -vserver {vserver} -volume {volume}",
+        #"SnapMirror destinations (specific volume)": (
+        #   f"snapmirror list-destinations -source-path {vserver}:{volume}"
+        #),
+    }
+
+    for desc, cmd in commands.items():
+        run_fetch(
+            filer_client,
+            cmd,
+            f_log=f_log,
+            context=f"{vserver}:{volume} - {desc}"
+        )
 
 # ---- parse snapmirror output into pairs ----
 def parse_snapmirror_pairs(output):
@@ -323,7 +396,7 @@ def compare_snapmirror_qtrees(filer_client, jump_client, admin_pass, vserver, sn
     for src_v, src_vol, dst_v, dst_vol in pairs:
         src_cmd = f"vol qtree show -vserver {src_v} -volume {src_vol} -fields export-policy"
         src_out = run_fetch(filer_client, src_cmd, f_log=f_log, context=f"{vserver} - snap source qtree ({src_v}:{src_vol})")
-        src_qtrees = set(parse_qtrees_from_qtree_show(src_out))
+        src_qtrees = set(parse_qtrees_and_export_policies_from_qtree_show(src_out))
 
         dest_physical = get_physical_filer_for_vserver(jump_client, dst_v, f_log)
         if not dest_physical:
@@ -338,14 +411,15 @@ def compare_snapmirror_qtrees(filer_client, jump_client, admin_pass, vserver, sn
             dest_client.connect(dest_physical, username="admin", password=admin_pass, sock=channel)
             dst_cmd = f"vol qtree show -vserver {dst_v} -volume {dst_vol} -fields export-policy"
             dst_out = run_fetch(dest_client, dst_cmd, f_log=f_log, context=f"{vserver} - snap dest qtree ({dst_v}:{dst_vol})")
-            dst_qtrees = set(parse_qtrees_from_qtree_show(dst_out))
+            dst_qtrees = set(parse_qtrees_and_export_policies_from_qtree_show(dst_out))
             dest_client.close()
         except Exception as e:
             reasons.append(f"failed to connect to destination physical filer {dest_physical} for {dst_v}: {e}")
             return False, reasons
 
-        src_qtrees_norm = {q for q in src_qtrees if q}
-        dst_qtrees_norm = {q for q in dst_qtrees if q}
+        # compare qtree names (non-empty) equality
+        src_qtrees_norm = {q for q, _ in src_qtrees if q}
+        dst_qtrees_norm = {q for q, _ in dst_qtrees if q}
 
         if src_qtrees_norm != dst_qtrees_norm:
             reasons.append(
@@ -367,12 +441,12 @@ def reconfirm_volume_dedicated(filer_client, jump_client, admin_pass, vserver, v
     if "there are no entries matching your query." in qtree_out_l or not qtree_out_l.strip():
         pass
     else:
-        qtree_list = parse_qtrees_from_qtree_show(qtree_out)
-        if not qtree_list or all(q == "" for q in qtree_list):
+        qtree_list = parse_qtrees_and_export_policies_from_qtree_show(qtree_out)
+        if not qtree_list or all(q == "" for q, _ in qtree_list):
             pass
         else:
-            non_empty_qtrees = [q for q in qtree_list if q]
-            ok, q_reasons = check_qtrees_against_global(filer_client, vserver, non_empty_qtrees, global_clients, f_log)
+            non_empty_qtrees = [pair for pair in qtree_list if pair[0] or pair[1]]
+            ok, q_reasons, _ = check_qtrees_against_global_using_export_policy(filer_client, vserver, non_empty_qtrees, global_clients, f_log)
             if not ok:
                 reasons.extend(q_reasons)
 
@@ -412,12 +486,12 @@ def is_vserver_really_dedicated(filer_client, vserver, global_clients, jump_clie
     if "there are no entries matching your query." in qtree_out_l or not qtree_out_l.strip():
         pass
     else:
-        qtree_list = parse_qtrees_from_qtree_show(qtree_out)
-        if all(q == "" for q in qtree_list):
+        qtree_list = parse_qtrees_and_export_policies_from_qtree_show(qtree_out)
+        if all(q == "" for q, _ in qtree_list):
             pass
         else:
-            non_empty_qtrees = [q for q in qtree_list if q]
-            ok, q_reasons = check_qtrees_against_global(filer_client, vserver, non_empty_qtrees, global_clients, f_log)
+            non_empty_qtrees = [pair for pair in qtree_list if pair[0] or pair[1]]
+            ok, q_reasons, _ = check_qtrees_against_global_using_export_policy(filer_client, vserver, non_empty_qtrees, global_clients, f_log)
             if not ok:
                 reasons.extend(q_reasons)
 
@@ -505,7 +579,7 @@ def special_policy_volume_check(filer_client, jump_client, admin_pass, vserver, 
     target_qtrees = []
 
     for vol in vol_lines:
-        q_cmd = f"qtree show -vserver {vserver} -volume {vol}"
+        q_cmd = f"qtree show -vserver {vserver} -volume {vol} -fields export-policy"
         q_out = run_fetch(
             filer_client,
             q_cmd,
@@ -513,9 +587,9 @@ def special_policy_volume_check(filer_client, jump_client, admin_pass, vserver, 
             context=f"{vserver}:{vol} - qtree show (special logic)"
         )
 
-        qtrees = parse_qtrees_from_qtree_show(q_out)
+        qtrees = parse_qtrees_and_export_policies_from_qtree_show(q_out)
 
-        for q in qtrees:
+        for q, _ in qtrees:
             if q and q.lower() == p_low:
                 target_volume = vol
                 target_qtrees = qtrees
@@ -533,28 +607,11 @@ def special_policy_volume_check(filer_client, jump_client, admin_pass, vserver, 
     all_ok = True
     extra_clients_accum = set()
 
-    for q in target_qtrees:
-        if not q:
-            continue
-
-        cmd = f"export-policy rule show -vserver {vserver} -policyname {q} -fields clientmatch"
-        out = run_check(
-            filer_client,
-            cmd,
-            f_log=f_log,
-            context=f"{vserver}:{q} - export-policy (special check)"
-        )
-
-        clients = parse_clientmatches_from_export_policy(out)
-        clients_l = {normalize_clientmatch(x) for x in clients if x}
-
-        if not clients_l:
-            continue  # empty clientmatch list = no violation
-
-        extra = clients_l - set(allowed_clients)
-        if extra:
-            all_ok = False
-            extra_clients_accum.update(extra)
+    non_empty_qpairs = [pair for pair in target_qtrees if pair[0] or pair[1]]
+    ok, reasons, extras = check_qtrees_against_global_using_export_policy(filer_client, vserver, non_empty_qpairs, set(allowed_clients), f_log)
+    if not ok:
+        all_ok = False
+        extra_clients_accum.update(extras)
 
     # -------------------------------------------------------------
     # (4) Final classification
@@ -577,7 +634,7 @@ def special_policy_volume_check(filer_client, jump_client, admin_pass, vserver, 
 # === MAIN ===
 if __name__ == "__main__":
     jump_pass = getpass.getpass("Enter jump server password: ")
-    admin_pass = getpass.getpass("Enter admin password")
+    admin_pass = getpass.getpass("Enter admin password of physical filer: ")
 
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
     log_file = f"shared_check_all_{ts}.log"
@@ -653,11 +710,11 @@ if __name__ == "__main__":
                 vol_state = get_volume_state(filer_client, vserver, policy, f_log)
 
                 # -----------------------------
-                # REPLACED BLOCK: if not found_clients -> qtree-based decision
+                # if no clientmatches at policy level -> perform qtree-based decision using export-policy column
                 # -----------------------------
                 if not found_clients:
                     # === When no clientmatches found => Perform Qtree-based decision ===
-                    qtree_cmd = f"qtree show -vserver {vserver} -volume {policy}"
+                    qtree_cmd = f"qtree show -vserver {vserver} -volume {policy} -fields export-policy"
                     qtree_out = run_fetch(
                         filer_client,
                         qtree_cmd,
@@ -667,8 +724,9 @@ if __name__ == "__main__":
 
                     qtree_out_l = (qtree_out or "").lower().strip()
 
-                    # === EXTRA CONDITION: exact "no entries" message -> specific text ===
-                    if "there are no entries matching your query" in qtree_out_l:
+                    # === EXACT MESSAGE HANDLING ===
+                    # if exact phrase present -> instruct manual check for volume name
+                    if "there are no entries matching your query." in qtree_out_l or "there are no entries matching your query" in qtree_out_l:
                         status = "check manually - volume name"
                         log_append(
                             f_log,
@@ -677,8 +735,8 @@ if __name__ == "__main__":
                         )
                         continue
 
-                    if ("there are no entries matching your query." in qtree_out_l) or not qtree_out_l:
-                        # No qtrees returned
+                    if not qtree_out_l:
+                        # No qtrees returned (empty output)
                         result = "Please check this manually."
                         log_append(
                             f_log,
@@ -688,12 +746,13 @@ if __name__ == "__main__":
                         )
                         continue
 
-                    # Parse qtrees
-                    qtree_list = parse_qtrees_from_qtree_show(qtree_out)
-                    non_empty_qtrees = [q for q in qtree_list if q]
+                    # Parse qtrees and their export-policies
+                    qtree_pairs = parse_qtrees_and_export_policies_from_qtree_show(qtree_out)
+                    # Keep only non-empty rows (either qtree or export-policy)
+                    non_empty_pairs = [pair for pair in qtree_pairs if pair[0] or pair[1]]
 
-                    if not non_empty_qtrees:
-                        # All qtree names are "" or unusable
+                    if not non_empty_pairs:
+                        # All qtree names and export-policy values are blank/unusable
                         result = "Please check this manually."
                         log_append(
                             f_log,
@@ -703,43 +762,30 @@ if __name__ == "__main__":
                         )
                         continue
                     else:
-                        # Now check clientmatch for every qtree
-                        all_ok = True
-                        external_clients = set()
+                        # Now check clientmatch for every qtree/export-policy pair
+                        ok, reasons, external_clients = check_qtrees_against_global_using_export_policy(
+                            filer_client, vserver, non_empty_pairs, global_clients, f_log
+                        )
 
-                        for q in non_empty_qtrees:
-                            ep_cmd_q = f"export-policy rule show -vserver {vserver} -policyname {q} -fields clientmatch"
-                            ep_out_q = run_check(
-                                filer_client,
-                                ep_cmd_q,
-                                f_log=f_log,
-                                context=f"{vserver}:{q} - export-policy (not-found-clients)"
-                            )
-
-                            q_clients = parse_clientmatches_from_export_policy(ep_out_q)
-                            q_clients_norm = {normalize_clientmatch(x) for x in q_clients if x}
-
-                            extra_q = q_clients_norm - global_clients
-                            if extra_q:
-                                all_ok = False
-                                external_clients.update(extra_q)
-
-                        # Final classification
-                        if all_ok:
+                        if ok:
                             result = "DEDICATED VOLUME"
-                            reason = "All qtrees contain only clients from input CSV"
+                            reason = "All qtrees/export-policies contain only clients from input CSV"
+                            log_append(
+                                f_log,
+                                f"==> RESULT: {vserver}:{policy} | {result} {{reason: {reason}}} | State: {vol_state}",
+                                f_res
+                            )
                         else:
                             result = "SHARED VOLUME"
-                            reason = f"Qtrees have external clients: {', '.join(sorted(external_clients))}"
-
-                        log_append(
-                            f_log,
-                            f"==> RESULT: {vserver}:{policy} | {result} {{reason: {reason}}}",
-                            f_res
-                        )
+                            reason = f"Qtrees/export-policies have external clients: {', '.join(sorted(external_clients))}"
+                            log_append(
+                                f_log,
+                                f"==> RESULT: {vserver}:{policy} | {result} {{reason: {reason}}} | State: {vol_state}",
+                                f_res
+                            )
                         continue
                 # -----------------------------
-                # END REPLACED BLOCK
+                # END qtree-based logic
                 # -----------------------------
                 elif extra:
                     # shared immediately at policy level
